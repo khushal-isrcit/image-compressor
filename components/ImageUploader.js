@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import imageCompression from "browser-image-compression";
 
 const SUPPORTED_FILE_TYPES = ["image/jpeg", "image/png", "image/webp"];
@@ -38,12 +38,49 @@ function createDownloadName(fileName) {
   return `${name}-compressed${extension}`;
 }
 
+function createSummaryError(invalidTypeCount, oversizeCount) {
+  const messages = [];
+
+  if (invalidTypeCount > 0) {
+    messages.push(
+      `${invalidTypeCount} file${invalidTypeCount > 1 ? "s were" : " was"} skipped because only JPG, PNG, and WebP are supported.`
+    );
+  }
+
+  if (oversizeCount > 0) {
+    messages.push(
+      `${oversizeCount} file${oversizeCount > 1 ? "s were" : " was"} skipped because the size limit is 20 MB per image.`
+    );
+  }
+
+  return messages.join(" ");
+}
+
+function revokeItemUrls(item, includeOriginal = true) {
+  if (includeOriginal && item.originalUrl) {
+    URL.revokeObjectURL(item.originalUrl);
+  }
+
+  if (item.compressedUrl) {
+    URL.revokeObjectURL(item.compressedUrl);
+  }
+}
+
+function downloadFile(file) {
+  const link = document.createElement("a");
+  const downloadUrl = URL.createObjectURL(file);
+  link.href = downloadUrl;
+  link.download = createDownloadName(file.name);
+  link.click();
+  URL.revokeObjectURL(downloadUrl);
+}
+
 export default function ImageUploader() {
   const inputId = useId();
-  const [file, setFile] = useState(null);
-  const [originalImage, setOriginalImage] = useState("");
-  const [compressedImage, setCompressedImage] = useState("");
-  const [compressedFile, setCompressedFile] = useState(null);
+  const nextIdRef = useRef(0);
+  const itemsRef = useRef([]);
+  const zoomImageRef = useRef(null);
+  const [items, setItems] = useState([]);
   const [compression, setCompression] = useState(30);
   const [loading, setLoading] = useState(false);
   const [zoomImage, setZoomImage] = useState(null);
@@ -51,20 +88,22 @@ export default function ImageUploader() {
   const [errorMessage, setErrorMessage] = useState("");
 
   useEffect(() => {
+    itemsRef.current = items;
+  }, [items]);
+
+  useEffect(() => {
+    zoomImageRef.current = zoomImage;
+  }, [zoomImage]);
+
+  useEffect(() => {
     return () => {
-      if (originalImage) {
-        URL.revokeObjectURL(originalImage);
-      }
+      itemsRef.current.forEach((item) => revokeItemUrls(item));
 
-      if (compressedImage) {
-        URL.revokeObjectURL(compressedImage);
-      }
-
-      if (zoomImage?.src) {
-        URL.revokeObjectURL(zoomImage.src);
+      if (zoomImageRef.current?.src) {
+        URL.revokeObjectURL(zoomImageRef.current.src);
       }
     };
-  }, [compressedImage, originalImage, zoomImage]);
+  }, []);
 
   function closeZoom() {
     if (zoomImage?.src) {
@@ -87,42 +126,50 @@ export default function ImageUploader() {
     });
   }
 
-  function resetCompressionResult() {
-    if (compressedImage) {
-      URL.revokeObjectURL(compressedImage);
-    }
-
-    setCompressedImage("");
-    setCompressedFile(null);
+  function replaceItems(nextItems) {
+    setItems((currentItems) => {
+      currentItems.forEach((item) => revokeItemUrls(item));
+      return nextItems;
+    });
   }
 
-  function handleSelectedFile(selectedFile) {
-    if (!selectedFile) return;
+  function handleSelectedFiles(selectedFiles) {
+    if (!selectedFiles.length) return;
 
-    if (!SUPPORTED_FILE_TYPES.includes(selectedFile.type)) {
-      setErrorMessage("Upload a JPG, PNG, or WebP image.");
-      return;
-    }
+    let invalidTypeCount = 0;
+    let oversizeCount = 0;
 
-    if (selectedFile.size > MAX_FILE_SIZE_BYTES) {
-      setErrorMessage("Choose an image smaller than 20 MB for reliable compression.");
-      return;
-    }
+    const validItems = selectedFiles.reduce((accumulator, selectedFile) => {
+      if (!SUPPORTED_FILE_TYPES.includes(selectedFile.type)) {
+        invalidTypeCount += 1;
+        return accumulator;
+      }
 
-    setErrorMessage("");
+      if (selectedFile.size > MAX_FILE_SIZE_BYTES) {
+        oversizeCount += 1;
+        return accumulator;
+      }
+
+      accumulator.push({
+        id: nextIdRef.current++,
+        file: selectedFile,
+        originalUrl: URL.createObjectURL(selectedFile),
+        compressedFile: null,
+        compressedUrl: "",
+        error: "",
+      });
+
+      return accumulator;
+    }, []);
+
     closeZoom();
-    resetCompressionResult();
-
-    if (originalImage) {
-      URL.revokeObjectURL(originalImage);
-    }
-
-    setFile(selectedFile);
-    setOriginalImage(URL.createObjectURL(selectedFile));
+    replaceItems(validItems);
+    setErrorMessage(createSummaryError(invalidTypeCount, oversizeCount));
   }
 
   function handleImageUpload(event) {
-    handleSelectedFile(event.target.files?.[0]);
+    handleSelectedFiles(Array.from(event.target.files ?? []));
+    event.target.value = "";
   }
 
   function handleDragOver(event) {
@@ -138,54 +185,87 @@ export default function ImageUploader() {
   function handleDrop(event) {
     event.preventDefault();
     setIsDragging(false);
-    handleSelectedFile(event.dataTransfer.files?.[0]);
+    handleSelectedFiles(Array.from(event.dataTransfer.files ?? []));
   }
 
-  async function compressImage() {
-    if (!file) return;
+  async function compressImages() {
+    if (!items.length) return;
 
     setLoading(true);
     setErrorMessage("");
-    resetCompressionResult();
+    closeZoom();
 
-    const reductionPercent = Math.min(compression * 1.8, 92);
-    const targetSizeBytes = Math.max(file.size * (1 - reductionPercent / 100), 120 * 1024);
-    const targetSizeMB = targetSizeBytes / (1024 * 1024);
-    const quality = Math.max(0.1, 1 - reductionPercent / 100);
+    const results = await Promise.all(
+      items.map(async (item) => {
+        const reductionPercent = Math.min(compression * 1.8, 92);
+        const targetSizeBytes = Math.max(item.file.size * (1 - reductionPercent / 100), 120 * 1024);
+        const targetSizeMB = targetSizeBytes / (1024 * 1024);
+        const quality = Math.max(0.1, 1 - reductionPercent / 100);
 
-    try {
-      const result = await imageCompression(file, {
-        maxSizeMB: targetSizeMB,
-        maxWidthOrHeight: 2200,
-        useWebWorker: true,
-        initialQuality: quality,
+        try {
+          const result = await imageCompression(item.file, {
+            maxSizeMB: targetSizeMB,
+            maxWidthOrHeight: 2200,
+            useWebWorker: true,
+            initialQuality: quality,
+          });
+
+          return {
+            ...item,
+            compressedFile: result,
+            compressedUrl: URL.createObjectURL(result),
+            error: "",
+          };
+        } catch (error) {
+          console.error(`Compression error for ${item.file.name}:`, error);
+
+          return {
+            ...item,
+            compressedFile: null,
+            compressedUrl: "",
+            error: "Compression failed for this image. Try a lighter setting.",
+          };
+        }
+      })
+    );
+
+    setItems((currentItems) => {
+      currentItems.forEach((item) => {
+        if (item.compressedUrl) {
+          URL.revokeObjectURL(item.compressedUrl);
+        }
       });
 
-      setCompressedFile(result);
-      setCompressedImage(URL.createObjectURL(result));
-    } catch (error) {
-      console.error("Compression error:", error);
-      setErrorMessage("Compression failed. Try a different image or a lighter compression level.");
-    } finally {
-      setLoading(false);
+      return results;
+    });
+
+    if (results.some((item) => item.error)) {
+      setErrorMessage("Some images could not be compressed. You can still download the successful results.");
     }
+
+    setLoading(false);
   }
 
-  function downloadCompressedImage() {
-    if (!compressedFile) return;
-
-    const link = document.createElement("a");
-    const downloadUrl = URL.createObjectURL(compressedFile);
-    link.href = downloadUrl;
-    link.download = createDownloadName(compressedFile.name);
-    link.click();
-    URL.revokeObjectURL(downloadUrl);
+  function downloadCompressedImage(item) {
+    if (!item.compressedFile) return;
+    downloadFile(item.compressedFile);
   }
 
-  const originalSize = file?.size ?? 0;
-  const compressedSize = compressedFile?.size ?? 0;
+  function downloadAllCompressedImages() {
+    const compressedItems = items.filter((item) => item.compressedFile);
+
+    compressedItems.forEach((item, index) => {
+      window.setTimeout(() => {
+        downloadFile(item.compressedFile);
+      }, index * 150);
+    });
+  }
+
+  const originalSize = items.reduce((total, item) => total + item.file.size, 0);
+  const compressedSize = items.reduce((total, item) => total + (item.compressedFile?.size ?? 0), 0);
   const savedPercentage = calculateSaving(originalSize, compressedSize);
   const savedBytes = Math.max(0, originalSize - compressedSize);
+  const compressedCount = items.filter((item) => item.compressedFile).length;
 
   return (
     <section className="grid gap-8 xl:grid-cols-[1.15fr_0.85fr]">
@@ -206,6 +286,7 @@ export default function ImageUploader() {
               id={inputId}
               type="file"
               accept={SUPPORTED_FILE_TYPES.join(",")}
+              multiple
               onChange={handleImageUpload}
               className="hidden"
             />
@@ -215,22 +296,25 @@ export default function ImageUploader() {
             </div>
 
             <h2 className="max-w-lg text-2xl font-semibold tracking-tight text-slate-950 sm:text-3xl">
-              Upload an image and shrink file size without leaving the browser
+              Upload multiple images and shrink file size together without leaving the browser
             </h2>
 
             <p className="mt-3 max-w-xl text-sm leading-6 text-slate-600 sm:text-base">
-              Fast client-side compression for JPG, PNG, and WebP. No uploads to a server, no waiting room, and no hidden watermark.
+              Fast client-side compression for JPG, PNG, and WebP. Select a batch, compress everything in one go, and download each optimized image locally.
             </p>
 
             <div className="mt-6 flex flex-wrap items-center justify-center gap-3 text-sm text-slate-500">
               <span className="rounded-full bg-slate-100 px-3 py-1">Private processing</span>
-              <span className="rounded-full bg-slate-100 px-3 py-1">Up to 20 MB</span>
-              <span className="rounded-full bg-slate-100 px-3 py-1">Mobile friendly</span>
+              <span className="rounded-full bg-slate-100 px-3 py-1">Up to 20 MB each</span>
+              <span className="rounded-full bg-slate-100 px-3 py-1">Batch friendly</span>
             </div>
           </label>
 
           {errorMessage ? (
-            <p className="mt-4 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700" aria-live="polite">
+            <p
+              className="mt-4 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700"
+              aria-live="polite"
+            >
               {errorMessage}
             </p>
           ) : null}
@@ -238,13 +322,15 @@ export default function ImageUploader() {
 
         <div className="grid gap-4 sm:grid-cols-3">
           <div className="rounded-[1.5rem] border border-slate-200/70 bg-white/80 p-5 shadow-sm">
-            <p className="text-sm text-slate-500">Original size</p>
+            <p className="text-sm text-slate-500">Original total</p>
             <p className="mt-2 text-2xl font-semibold text-slate-950">{formatFileSize(originalSize)}</p>
+            <p className="mt-1 text-xs text-slate-500">{items.length} image{items.length === 1 ? "" : "s"}</p>
           </div>
 
           <div className="rounded-[1.5rem] border border-slate-200/70 bg-white/80 p-5 shadow-sm">
-            <p className="text-sm text-slate-500">Compressed size</p>
+            <p className="text-sm text-slate-500">Compressed total</p>
             <p className="mt-2 text-2xl font-semibold text-slate-950">{formatFileSize(compressedSize)}</p>
+            <p className="mt-1 text-xs text-slate-500">{compressedCount} ready to download</p>
           </div>
 
           <div className="rounded-[1.5rem] border border-emerald-200/80 bg-emerald-50 p-5 shadow-sm">
@@ -254,75 +340,110 @@ export default function ImageUploader() {
           </div>
         </div>
 
-        {originalImage ? (
-          <div className="grid gap-6 lg:grid-cols-2">
-            <article className="rounded-[1.75rem] border border-slate-200/80 bg-white/85 p-4 shadow-sm backdrop-blur">
-              <div className="mb-4 flex items-center justify-between gap-4">
-                <div>
-                  <h3 className="text-lg font-semibold text-slate-950">Original image</h3>
-                  <p className="text-sm text-slate-500">{file?.name}</p>
-                </div>
-                <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-700">
-                  {formatFileSize(originalSize)}
-                </span>
+        {items.length ? (
+          <div className="space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h3 className="text-xl font-semibold text-slate-950">Image batch</h3>
+                <p className="text-sm text-slate-500">
+                  Preview each original and compressed result side by side.
+                </p>
               </div>
 
-              <button
-                type="button"
-                onClick={() => openZoom(file, "Original image preview")}
-                className="block h-80 w-full overflow-hidden rounded-[1.25rem] border border-slate-200 bg-slate-100"
-              >
-                <img
-                  src={originalImage}
-                  alt="Original upload preview"
-                  className="h-full w-full object-cover transition duration-300 hover:scale-[1.03]"
-                />
-              </button>
-            </article>
-
-            <article className="rounded-[1.75rem] border border-slate-200/80 bg-white/85 p-4 shadow-sm backdrop-blur">
-              <div className="mb-4 flex items-center justify-between gap-4">
-                <div>
-                  <h3 className="text-lg font-semibold text-slate-950">Compressed result</h3>
-                  <p className="text-sm text-slate-500">
-                    {compressedImage ? "Ready to preview and download." : "Run compression to compare the result."}
-                  </p>
-                </div>
-                <span className="rounded-full bg-amber-100 px-3 py-1 text-xs font-medium text-amber-800">
-                  {compressedImage ? `${savedPercentage}% saved` : "Pending"}
-                </span>
-              </div>
-
-              <div className="flex h-80 items-center justify-center overflow-hidden rounded-[1.25rem] border border-slate-200 bg-[radial-gradient(circle_at_top,rgba(251,191,36,0.12),transparent_42%),linear-gradient(180deg,#f8fafc,#e2e8f0)]">
-                {compressedImage ? (
-                  <button
-                    type="button"
-                    onClick={() => openZoom(compressedFile, "Compressed image preview")}
-                    className="block h-full w-full"
-                  >
-                    <img
-                      src={compressedImage}
-                      alt="Compressed upload preview"
-                      className="h-full w-full object-cover transition duration-300 hover:scale-[1.03]"
-                    />
-                  </button>
-                ) : (
-                  <p className="max-w-xs text-center text-sm leading-6 text-slate-500">
-                    The compressed preview will appear here with updated file size and savings.
-                  </p>
-                )}
-              </div>
-
-              {compressedImage ? (
+              {compressedCount ? (
                 <button
                   type="button"
-                  onClick={downloadCompressedImage}
-                  className="mt-4 inline-flex items-center justify-center rounded-full bg-slate-950 px-5 py-3 text-sm font-medium text-white transition hover:bg-slate-800"
+                  onClick={downloadAllCompressedImages}
+                  className="inline-flex items-center justify-center rounded-full bg-slate-950 px-5 py-3 text-sm font-medium text-white transition hover:bg-slate-800"
                 >
-                  Download compressed image
+                  Download all compressed images
                 </button>
               ) : null}
-            </article>
+            </div>
+
+            <div className="grid gap-6">
+              {items.map((item) => {
+                const itemCompressedSize = item.compressedFile?.size ?? 0;
+                const itemSavedPercentage = calculateSaving(item.file.size, itemCompressedSize);
+
+                return (
+                  <article
+                    key={item.id}
+                    className="rounded-[1.75rem] border border-slate-200/80 bg-white/85 p-4 shadow-sm backdrop-blur"
+                  >
+                    <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+                      <div>
+                        <h4 className="text-lg font-semibold text-slate-950">{item.file.name}</h4>
+                        <p className="text-sm text-slate-500">
+                          {formatFileSize(item.file.size)}
+                          {item.compressedFile ? ` -> ${formatFileSize(itemCompressedSize)}` : " -> waiting for compression"}
+                        </p>
+                      </div>
+
+                      <span
+                        className={`rounded-full px-3 py-1 text-xs font-medium ${
+                          item.compressedFile
+                            ? "bg-emerald-100 text-emerald-800"
+                            : "bg-slate-100 text-slate-700"
+                        }`}
+                      >
+                        {item.compressedFile ? `${itemSavedPercentage}% saved` : "Pending"}
+                      </span>
+                    </div>
+
+                    <div className="grid gap-4 lg:grid-cols-2">
+                      <div>
+                        <p className="mb-2 text-sm font-medium text-slate-700">Original</p>
+                        <button
+                          type="button"
+                          onClick={() => openZoom(item.file, `Original preview for ${item.file.name}`)}
+                          className="block h-64 w-full overflow-hidden rounded-[1.25rem] border border-slate-200 bg-slate-100"
+                        >
+                          <img
+                            src={item.originalUrl}
+                            alt={`Original preview for ${item.file.name}`}
+                            className="h-full w-full object-cover transition duration-300 hover:scale-[1.03]"
+                          />
+                        </button>
+                      </div>
+
+                      <div>
+                        <p className="mb-2 text-sm font-medium text-slate-700">Compressed</p>
+                        <div className="flex h-64 items-center justify-center overflow-hidden rounded-[1.25rem] border border-slate-200 bg-[radial-gradient(circle_at_top,rgba(251,191,36,0.12),transparent_42%),linear-gradient(180deg,#f8fafc,#e2e8f0)]">
+                          {item.compressedUrl ? (
+                            <button
+                              type="button"
+                              onClick={() => openZoom(item.compressedFile, `Compressed preview for ${item.file.name}`)}
+                              className="block h-full w-full"
+                            >
+                              <img
+                                src={item.compressedUrl}
+                                alt={`Compressed preview for ${item.file.name}`}
+                                className="h-full w-full object-cover transition duration-300 hover:scale-[1.03]"
+                              />
+                            </button>
+                          ) : (
+                            <p className="max-w-xs text-center text-sm leading-6 text-slate-500">
+                              {item.error || "Compressed preview will appear here after the batch run."}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    {item.compressedFile ? (
+                      <button
+                        type="button"
+                        onClick={() => downloadCompressedImage(item)}
+                        className="mt-4 inline-flex items-center justify-center rounded-full bg-slate-950 px-5 py-3 text-sm font-medium text-white transition hover:bg-slate-800"
+                      >
+                        Download compressed image
+                      </button>
+                    ) : null}
+                  </article>
+                );
+              })}
+            </div>
           </div>
         ) : null}
       </div>
@@ -330,7 +451,9 @@ export default function ImageUploader() {
       <aside className="rounded-[2rem] border border-slate-200/70 bg-[linear-gradient(180deg,rgba(255,251,235,0.92),rgba(255,255,255,0.98))] p-6 shadow-[0_20px_70px_rgba(148,163,184,0.18)]">
         <div className="rounded-[1.5rem] border border-white/80 bg-white/70 p-5">
           <p className="text-sm font-semibold uppercase tracking-[0.22em] text-amber-700">Compression control</p>
-          <h3 className="mt-3 text-2xl font-semibold tracking-tight text-slate-950">Choose how aggressive the file reduction should be</h3>
+          <h3 className="mt-3 text-2xl font-semibold tracking-tight text-slate-950">
+            Choose how aggressive the file reduction should be
+          </h3>
           <p className="mt-3 text-sm leading-6 text-slate-600">
             Lower settings preserve more detail. Higher settings target stronger size reduction for web uploads, messaging, and lightweight pages.
           </p>
@@ -371,11 +494,11 @@ export default function ImageUploader() {
 
           <button
             type="button"
-            onClick={compressImage}
-            disabled={!file || loading}
+            onClick={compressImages}
+            disabled={!items.length || loading}
             className="mt-6 inline-flex w-full items-center justify-center rounded-full bg-amber-500 px-5 py-3.5 text-sm font-semibold text-slate-950 transition hover:bg-amber-400 disabled:cursor-not-allowed disabled:opacity-55"
           >
-            {loading ? "Compressing image..." : "Compress now"}
+            {loading ? "Compressing images..." : "Compress all images"}
           </button>
         </div>
 
@@ -390,7 +513,7 @@ export default function ImageUploader() {
           <div className="rounded-[1.25rem] border border-slate-200/70 bg-white/75 p-4">
             <p className="text-sm font-semibold text-slate-900">Best use cases</p>
             <p className="mt-1 text-sm leading-6 text-slate-600">
-              Blog images, ecommerce product photos, portfolio uploads, social sharing assets, and faster website media delivery.
+              Blog image batches, ecommerce product photos, portfolio uploads, social sharing assets, and faster website media delivery.
             </p>
           </div>
         </div>
