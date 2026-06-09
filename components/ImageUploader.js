@@ -201,7 +201,6 @@ export default function ImageUploader() {
         const targetSizeBytes = Math.max(item.file.size * (1 - reductionPercent / 100), 120 * 1024);
         const targetSizeMB = targetSizeBytes / (1024 * 1024);
         const quality = Math.max(0.1, 1 - reductionPercent / 100);
-
         try {
           const result = await imageCompression(item.file, {
             maxSizeMB: targetSizeMB,

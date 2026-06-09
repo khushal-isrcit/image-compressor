@@ -1,4 +1,5 @@
 import Header from "../components/Header";
+import ToolNav from "../components/ToolNav";
 import ImageUploader from "../components/ImageUploader";
 
 const faqItems = [
@@ -47,6 +48,7 @@ export default function HomePage() {
         </div>
 
         <div className="mt-12">
+          <ToolNav />
           <ImageUploader />
         </div>
       </section>
